@@ -42,27 +42,36 @@ const persistedPort = (() => {
     return (isFinite(n) && n >= 1024 && n <= 65535) ? n : null;
   } catch { return null; }
 })();
-const STARTING_PORT = persistedPort || DEFAULT_PORT;
+const envPort = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
+const STARTING_PORT = (isFinite(envPort) && envPort > 0) ? envPort : (persistedPort || DEFAULT_PORT);
+const HOST = process.env.HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
 const MAX_PORT_SCAN = 50; // 47371 → 47420 is enough headroom for any conceivable collision
 
 const app = express();
+app.set('trust proxy', true);
 
-// v1.10.0 — CORS lockdown. Previously `app.use(cors())` echoed
-// Access-Control-Allow-Origin: *, which meant any site the user visited
-// could `fetch('http://localhost:47371/api/bills')` and read/wipe all
-// data. This is a local desktop-style app: legitimate callers either
-// have no Origin header (same-page fetch from our own served HTML,
-// browsers' XHR to localhost from about:blank tools, curl) or an
-// Origin pointing at http://localhost:<port>. Everything else is
-// rejected. The Vite dev server proxies /api → us so its origin is
-// also localhost.
+// CORS configuration — allows local development as well as deployment on cloud hosts
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+  const host = req.get('host');
+  const allowedOriginsEnv = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+    : [];
+
+  const isSameHost = origin && host && (
+    origin === `http://${host}` ||
+    origin === `https://${host}` ||
+    origin.replace(/^https?:\/\//, '') === host
+  );
+
   const allow =
     !origin ||
+    isSameHost ||
     /^https?:\/\/localhost(:\d+)?$/i.test(origin) ||
     /^https?:\/\/127\.0\.0\.1(:\d+)?$/i.test(origin) ||
-    /^https?:\/\/\[::1\](:\d+)?$/i.test(origin);
+    /^https?:\/\/\[::1\](:\d+)?$/i.test(origin) ||
+    allowedOriginsEnv.includes(origin);
+
   if (!allow) {
     return res.status(403).json({ error: 'Cross-origin request refused' });
   }
@@ -2176,17 +2185,22 @@ process.on('unhandledRejection', (err) => { console.error(`  Unexpected error (t
 // every byte stays on the user's machine, which the privacy promise depends on.
 let activeServer = null;
 function startServer(port) {
-  const server = app.listen(port, '127.0.0.1', () => {
+  const server = app.listen(port, HOST, () => {
     activeServer = server;
-    // Persist the chosen port — the .bat launcher reads this for the browser URL.
-    // Writing on EVERY successful boot means: if our preferred 47371 was busy and
-    // we landed on 47372 instead, next launch tries 47372 first (cuts collision
-    // scans in half on repeated reboots of whatever was holding 47371).
-    try { fs.writeFileSync(PORT_FILE, String(port), 'utf-8'); } catch { /* ignore */ }
-    console.log(`\n  Free GST Billing Software running at http://localhost:${port}`);
+    // Persist the chosen port when running locally
+    if (!process.env.PORT) {
+      try { fs.writeFileSync(PORT_FILE, String(port), 'utf-8'); } catch { /* ignore */ }
+    }
+    const displayHost = (HOST === '0.0.0.0' || HOST === '127.0.0.1') ? 'localhost' : HOST;
+    console.log(`\n  Free GST Billing Software running at http://${displayHost}:${port}`);
     console.log(`  Data stored in: ${DATA_DIR}\n`);
   });
   server.on('error', (err) => {
+    if (process.env.PORT) {
+      console.error(`  Failed to start server on PORT ${port}: ${err.message}`);
+      logFatal(err, 'startup');
+      process.exit(1);
+    }
     // v1.10.83 - EACCES too: Windows reserves port ranges for Hyper-V / WSL
     // and refuses them with "access denied" rather than "in use".
     if ((err.code === 'EADDRINUSE' || err.code === 'EACCES') && port !== 0 && port < STARTING_PORT + MAX_PORT_SCAN) {
